@@ -6,84 +6,134 @@ import com.di2win.desafio.model.Transacao;
 import com.di2win.desafio.repository.ClienteRepository;
 import com.di2win.desafio.repository.ContaRepository;
 import com.di2win.desafio.repository.TransacaoRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-
+import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.List;
-import java.util.Optional;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class ContaService {
 
-    private final ContaRepository contaRepository;
-    private final ClienteRepository clienteRepository;
-    private final TransacaoRepository transacaoRepository;
+    private final ContaRepository contaRepo;
+    private final ClienteRepository clienteRepo;
+    private final TransacaoRepository transacaoRepo;
+    private final BigDecimal limiteDiario;
 
-    public ContaService(ContaRepository contaRepository, ClienteRepository clienteRepository, TransacaoRepository transacaoRepository) {
-        this.contaRepository = contaRepository;
-        this.clienteRepository = clienteRepository;
-        this.transacaoRepository = transacaoRepository;
+    public ContaService(ContaRepository contaRepo, ClienteRepository clienteRepo,
+                        TransacaoRepository transacaoRepo,
+                        @Value("${app.saques.limite-diario:2000.00}") BigDecimal limiteDiario) {
+        this.contaRepo = contaRepo;
+        this.clienteRepo = clienteRepo;
+        this.transacaoRepo = transacaoRepo;
+        this.limiteDiario = limiteDiario;
     }
 
-    public Conta criarConta(String cpfCliente, String agencia, String numeroConta) {
-        Optional<Cliente> cliente = clienteRepository.findByCpf(cpfCliente);
-        if (cliente.isEmpty()) {
-            throw new RuntimeException("Cliente não encontrado");
-        }
+    private String gerarNumeroConta() {
+        return String.format("%08d", ThreadLocalRandom.current().nextInt(0, 100_000_000));
+    }
 
+    @Transactional
+    public Conta criarContaPorCpf(String cpf) {
+        Cliente cliente = clienteRepo.findByCpf(cpf.replaceAll("\\D", ""))
+                .orElseThrow(() -> new RecursoNaoEncontradoException("Cliente não encontrado para CPF"));
         Conta conta = new Conta();
-        conta.setCliente(cliente.get());
-        conta.setAgencia(agencia);
-        conta.setNumeroConta(numeroConta);
+        conta.setCliente(cliente);
+        conta.setAgencia("0001");
+        conta.setNumeroConta(gerarNumeroConta());
         conta.setSaldo(BigDecimal.ZERO);
         conta.setBloqueada(false);
-
-        return contaRepository.save(conta);
+        return contaRepo.save(conta);
     }
 
-    public Conta deposito(String numeroConta, BigDecimal valor) {
-        Conta conta = contaRepository.findByNumeroConta(numeroConta);
-        if (conta.isBloqueada()) throw new RuntimeException("Conta bloqueada");
+    public Conta buscarPorNumero(String numero) {
+        Conta c = contaRepo.findByNumeroConta(numero);
+        if (c == null) throw new RecursoNaoEncontradoException("Conta não encontrada");
+        return c;
+    }
+
+    @Transactional
+    public Transacao deposito(String numeroConta, BigDecimal valor) {
+        if (valor == null || valor.compareTo(BigDecimal.ZERO) <= 0)
+            throw new RegraNegocioException("Valor de depósito deve ser positivo");
+
+        Conta conta = buscarPorNumero(numeroConta);
+        if (conta.isBloqueada()) throw new RegraNegocioException("Conta bloqueada");
 
         conta.setSaldo(conta.getSaldo().add(valor));
-        contaRepository.save(conta);
+        contaRepo.save(conta);
 
-        Transacao transacao = new Transacao();
-        transacao.setTipo("DEPÓSITO");
-        transacao.setValor(valor);
-        transacao.setDataHora(LocalDateTime.now());
-        transacao.setConta(conta);
-        transacaoRepository.save(transacao);
-
-        return conta;
+        Transacao t = new Transacao();
+        t.setTipo("DEPOSITO");
+        t.setValor(valor);
+        t.setDataHora(LocalDateTime.now());
+        t.setConta(conta);
+        transacaoRepo.save(t);
+        return t;
     }
 
-    public Conta saque(String numeroConta, BigDecimal valor) {
-        Conta conta = contaRepository.findByNumeroConta(numeroConta);
-        if (conta.isBloqueada()) throw new RuntimeException("Conta bloqueada");
-        if (conta.getSaldo().compareTo(valor) < 0) throw new RuntimeException("Saldo insuficiente");
+    @Transactional
+    public Transacao saque(String numeroConta, BigDecimal valor) {
+        if (valor == null || valor.compareTo(BigDecimal.ZERO) <= 0)
+            throw new RegraNegocioException("Valor de saque deve ser positivo");
+
+        Conta conta = buscarPorNumero(numeroConta);
+        if (conta.isBloqueada()) throw new RegraNegocioException("Conta bloqueada");
+
+        // limite diário (somatório de hoje + este saque)
+        LocalDateTime inicio = LocalDate.now().atStartOfDay();
+        LocalDateTime fim = LocalDate.now().atTime(LocalTime.MAX);
+
+        BigDecimal totalSacadoHoje = transacaoRepo.findByContaIdAndDataHoraBetween(conta.getId(), inicio, fim)
+                .stream()
+                .filter(t -> "SAQUE".equalsIgnoreCase(t.getTipo()))
+                .map(t -> t.getValor() == null ? BigDecimal.ZERO : t.getValor())
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        if (totalSacadoHoje.add(valor).compareTo(limiteDiario) > 0) {
+            throw new RegraNegocioException("Limite diário de saque excedido. Limite: " + limiteDiario);
+        }
+
+        if (conta.getSaldo().compareTo(valor) < 0) {
+            throw new RegraNegocioException("Saldo insuficiente");
+        }
 
         conta.setSaldo(conta.getSaldo().subtract(valor));
-        contaRepository.save(conta);
+        contaRepo.save(conta);
 
-        Transacao transacao = new Transacao();
-        transacao.setTipo("SAQUE");
-        transacao.setValor(valor);
-        transacao.setDataHora(LocalDateTime.now());
-        transacao.setConta(conta);
-        transacaoRepository.save(transacao);
-
-        return conta;
+        Transacao t = new Transacao();
+        t.setTipo("SAQUE");
+        t.setValor(valor);
+        t.setDataHora(LocalDateTime.now());
+        t.setConta(conta);
+        transacaoRepo.save(t);
+        return t;
     }
 
-    public void bloquearConta(String numeroConta) {
-        Conta conta = contaRepository.findByNumeroConta(numeroConta);
-        conta.setBloqueada(true);
-        contaRepository.save(conta);
+    @Transactional
+    public void bloquear(String numeroConta) {
+        Conta c = buscarPorNumero(numeroConta);
+        c.setBloqueada(true);
+        contaRepo.save(c);
     }
 
-    public List<Transacao> extratoPorPeriodo(Long contaId, LocalDateTime inicio, LocalDateTime fim) {
-        return transacaoRepository.findByContaIdAndDataHoraBetween(contaId, inicio, fim);
+    @Transactional
+    public void desbloquear(String numeroConta) {
+        Conta c = buscarPorNumero(numeroConta);
+        c.setBloqueada(false);
+        contaRepo.save(c);
+    }
+
+    public BigDecimal consultarSaldo(String numeroConta) {
+        return buscarPorNumero(numeroConta).getSaldo();
+    }
+
+    public List<Transacao> extrato(String numeroConta, LocalDateTime inicio, LocalDateTime fim) {
+        Conta c = buscarPorNumero(numeroConta);
+        return transacaoRepo.findByContaIdAndDataHoraBetween(c.getId(), inicio, fim);
     }
 }
